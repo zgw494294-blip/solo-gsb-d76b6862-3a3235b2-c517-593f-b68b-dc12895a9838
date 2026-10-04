@@ -131,8 +131,10 @@ button.danger:hover:not(:disabled) { background: var(--danger-bg); }
 @media (max-width: 920px) { .columns { grid-template-columns: 1fr; } }
 
 .clause-list { list-style: none; margin: 0; padding: 0; }
-/* 合并 / 拆分 / 复制提交期间：暂时锁定列表内的编辑 / 删除 / 重排 / 勾选，结束后自动恢复 */
+/* 合并 / 拆分 / 复制 / 删除提交期间：暂时锁定列表内的编辑 / 删除 / 重排 / 勾选，结束后自动恢复。
+   锁定 / 解锁切换是纯内存操作，写稿等待期间也允许，故不被置灰层拦截。 */
 .clause-list.busy { pointer-events: none; opacity: 0.55; }
+.clause-list.busy .card .lock-btn { pointer-events: auto; }
 
 .card {
   border: 1px solid var(--line);
@@ -181,6 +183,20 @@ button.danger:hover:not(:disabled) { background: var(--danger-bg); }
   padding-left: 24px;
 }
 .card.source-broken { border-color: #f3c4c4; background: var(--danger-bg); }
+
+/* 已定稿（锁定）卡片：金色描边与「已定稿」标记；锁定不冻结重排、勾选与复制 */
+.card.locked { border-color: #d9b45c; background: #fdfaf1; }
+.card.locked.selected { border-color: var(--primary); box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.22); }
+.lock-tag {
+  background: #f5e6bf;
+  color: #8a5a00;
+  border: 1px solid #e3c987;
+  border-radius: 4px;
+  font-size: 11.5px;
+  padding: 0 7px;
+}
+.lock-btn { color: #8a5a00; border-color: #e3c987; }
+.lock-btn:hover:not(:disabled) { background: #fbf3dd; }
 
 .ref {
   display: inline-block;

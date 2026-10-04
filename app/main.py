@@ -73,6 +73,16 @@
 - 快照沿用草稿校验：基线与现稿均须通过既有状态校验，身份上界须覆盖基线、现稿及
   失效引用中出现的全部身份号（恢复后继续拆分 / 复制不会复用旧身份）；
   非法快照（422）或写入失败（500）时旧存档一律保留。
+
+条款锁定 / 定稿保护（写稿接口的 ``locked_ids`` 字段）：
+- 锁定集合仅存页面内存、不进存档协议；写稿请求（保存 / 删除 / 合并 / 拆分 / 复制）
+  提交时随请求附上当前锁定集合，由后端核验操作的**实际结果**。
+- 集合形态问题（身份形态非法、重复、含不存在身份、被锁条款当前正含失效引用）返回 422；
+  旧调用不传 ``locked_ids`` 时不做锁定检查，完全沿用原规则。
+- 锁定保护稳定身份存续、内部正文逐字不变与有效引用的目标存续；**不冻结被引用条款
+  正文**，纯重排与编号变化允许。任何操作只要改变任一锁定条款或使其引用失效，
+  整次拒绝（409），按操作前当前顺序列出受影响的锁定身份与原因，草稿不变。
+  复制不改动既有条款，允许复制锁定条款，副本自身不锁定。
 """
 
 from __future__ import annotations
@@ -121,21 +131,32 @@ class StateIn(BaseModel):
     clauses: list[ClauseIn]
 
 
-class SaveIn(BaseModel):
+class LockedIn:
+    """写稿请求携带锁定集合的混入基类。
+
+    ``locked_ids`` 为页面当前锁定（已定稿）的稳定身份集合，由后端核验操作的
+    实际结果：任何改变锁定条款身份、内部正文或使其有效引用失效的写稿整次拒绝
+    （409）。旧调用不传该字段时不做锁定检查，沿用原规则。
+    """
+
+    locked_ids: list[str] | None = None
+
+
+class SaveIn(LockedIn, BaseModel):
     order_ids: list[str]
     clauses: list[ClauseIn]
     edit_id: str
     text: str  # 编辑器中的正文（数字引用）
 
 
-class MergeIn(BaseModel):
+class MergeIn(LockedIn, BaseModel):
     order_ids: list[str]
     clauses: list[ClauseIn]
     keep_id: str  # 合并后沿用的身份（当前显示顺序中较前的一条）
     drop_id: str  # 被并入并移除的一条（当前显示顺序中较后的一条）
 
 
-class SplitIn(BaseModel):
+class SplitIn(LockedIn, BaseModel):
     order_ids: list[str]
     clauses: list[ClauseIn]
     split_id: str  # 被拆分的条款（前段沿用其身份）
@@ -144,13 +165,19 @@ class SplitIn(BaseModel):
     refs_to: str  # 原指向被拆条款的引用落到 "front"（前段）还是 "back"（后段）
 
 
+class DeleteIn(LockedIn, BaseModel):
+    order_ids: list[str]
+    clauses: list[ClauseIn]
+    delete_id: str  # 被删除的条款身份
+
+
 class DiffIn(BaseModel):
     # 成功导入后保留的不可变原稿基线；两份文档均沿用现有草稿结构
     baseline: StateIn
     current: StateIn
 
 
-class DuplicateIn(BaseModel):
+class DuplicateIn(LockedIn, BaseModel):
     order_ids: list[str]
     clauses: list[ClauseIn]
     selected_ids: list[str]  # 要复制的条款身份；按当前显示顺序复制整组
@@ -348,6 +375,125 @@ def resolve_body(body: str, pos_by_id: dict[str, int]) -> tuple[str, list[dict]]
 
 
 # --------------------------------------------------------------------------- #
+# 条款锁定（定稿保护）
+# --------------------------------------------------------------------------- #
+def _locked_ids(locked: list[str] | None, by_id: dict[str, ClauseIn] | None = None) -> set[str] | None:
+    """校验写稿请求携带的锁定集合，返回去重后的集合；``None`` 表示旧调用、不做锁定检查。
+
+    集合形态问题（身份形态非法、重复、含不存在身份、被锁条款当前正含失效引用）
+    一律 422 拒绝——请求本身非法，区别于操作结果与锁定冲突（409）。
+    """
+    if locked is None:
+        return None
+    errors: list[str] = []
+    seen: set[str] = set()
+    for cid in locked:
+        if not isinstance(cid, str) or not ID_RE.match(cid):
+            errors.append(f"锁定身份非法：{cid}")
+            continue
+        if cid in seen:
+            errors.append(f"锁定身份重复：{cid}")
+        seen.add(cid)
+        if by_id is not None and cid not in by_id:
+            errors.append(f"锁定身份不存在：{cid}")
+    if by_id is not None:
+        # 含失效引用的条款不能锁定：锁定只保护“有效引用的目标存续”，
+        # 已失效引用必须先修复
+        for cid in (c for c in seen if c in by_id):
+            for m in MARKER_RE.finditer(by_id[cid].body):
+                if m.group(1) not in by_id:
+                    errors.append(
+                        f"锁定条款 {cid}（原第 {cid[1:]} 条）含失效引用 "
+                        f"[[原{m.group(1)[1:]}?]]，请先修复再锁定"
+                    )
+    if errors:
+        raise HTTPException(422, detail={"errors": errors})
+    return seen
+
+
+def _lock_reason_messages(findings: list[dict]) -> list[str]:
+    """把锁定违例条目转成中文原因（同一身份的同类原因只列一条）。"""
+    messages: list[str] = []
+    for f in findings:
+        if f["reason"] == "removed":
+            messages.append(
+                f"锁定条款 {f['id']}（原第 {f['original']} 条）将被删除或并入移除，"
+                "定稿身份必须保留"
+            )
+        elif f["reason"] == "body_changed":
+            messages.append(f"锁定条款 {f['id']}（原第 {f['original']} 条）的内部正文将被改动")
+        else:
+            messages.append(
+                f"锁定条款 {f['id']}（原第 {f['original']} 条）的有效引用 "
+                f"{f['ref_id']}（原第 {f['ref_original']} 条）将失去目标"
+            )
+    return messages
+
+
+def _enforce_locks(
+    locked: set[str] | None,
+    old_order: list[str],
+    old_bodies: dict[str, str],
+    new_order: list[str],
+    new_bodies: dict[str, str],
+) -> None:
+    """按操作的**实际结果**核验锁定集合；违例整次拒绝（409）。
+
+    锁定保护：稳定身份存续、内部正文逐字不变、正文中有效引用的目标仍存续。
+    不冻结被引用条款的正文（被引用的非锁定条款可改），纯重排与编号变化不算违例。
+    受影响的锁定身份按**操作前当前顺序**列出（已移除的仍按其旧位置列出）。
+    """
+    if not locked:
+        return
+    pos_old = {cid: i for i, cid in enumerate(old_order)}
+    findings: list[dict] = []
+    seen: set[tuple] = set()
+
+    def add(cid: str, reason: str, ref_id: str | None = None) -> None:
+        key = (cid, reason, ref_id)
+        if key in seen:
+            return
+        seen.add(key)
+        findings.append(
+            {
+                "id": cid,
+                "original": int(cid[1:]),
+                "reason": reason,
+                **({"ref_id": ref_id, "ref_original": int(ref_id[1:])} if ref_id else {}),
+            }
+        )
+
+    for cid in locked:
+        if cid not in new_bodies:
+            add(cid, "removed")
+            continue
+        if new_bodies[cid] != old_bodies[cid]:
+            add(cid, "body_changed")
+        # 以结果正文为准：合并改指后仍有效的引用不报失效，仅报真正失去目标的
+        for m in MARKER_RE.finditer(new_bodies[cid]):
+            if m.group(1) not in new_bodies:
+                add(cid, "ref_broken", m.group(1))
+
+    if not findings:
+        return
+
+    def order_key(f: dict) -> int:
+        return pos_old.get(f["id"], len(old_order))
+
+    findings.sort(key=lambda f: order_key(f))
+    raise HTTPException(
+        409,
+        detail={
+            "errors": [
+                "操作与已定稿（锁定）条款冲突，整次拒绝，草稿、身份上界与复核均未改动：",
+                *_lock_reason_messages(findings),
+            ],
+            "locked_errors": findings,
+        },
+    )
+
+
+# --------------------------------------------------------------------------- #
 # 接口
 # --------------------------------------------------------------------------- #
 @app.post("/api/import")
@@ -362,6 +508,7 @@ def import_doc(payload: ImportIn):
 def save_clause(payload: SaveIn):
     """保存对某条正文的编辑：数字引用按**保存当刻**显示编号绑定。"""
     by_id = _validate_state(payload.order_ids, payload.clauses)
+    locked = _locked_ids(payload.locked_ids, by_id)
     if payload.edit_id not in by_id:
         raise HTTPException(422, detail={"errors": ["被编辑的条款不存在"]})
 
@@ -386,7 +533,29 @@ def save_clause(payload: SaveIn):
         return f"[[{target_id}]]"
 
     internal = MARKER_RE.sub(bind, text)
+    # 后端按操作的实际结果核验锁定：改动锁定条款正文即整次拒绝
+    new_bodies = {c.id: c.body for c in payload.clauses}
+    new_bodies[payload.edit_id] = internal
+    _enforce_locks(locked, payload.order_ids, {c.id: c.body for c in payload.clauses}, payload.order_ids, new_bodies)
     return {"id": payload.edit_id, "body": internal}
+
+
+@app.post("/api/delete")
+def delete_clause(payload: DeleteIn):
+    """删除一条条款。
+
+    删除经 HTTP 处理，携带锁定集合：删除锁定条款本身、或删除被锁定条款有效引用
+    的目标（使其引用失效）都整次拒绝（409），按操作前顺序列出受影响的锁定身份。
+    """
+    by_id = _validate_state(payload.order_ids, payload.clauses)
+    locked = _locked_ids(payload.locked_ids, by_id)
+    if payload.delete_id not in by_id:
+        raise HTTPException(422, detail={"errors": ["被删除的条款不存在"]})
+    old_bodies = {c.id: c.body for c in payload.clauses}
+    new_order = [cid for cid in payload.order_ids if cid != payload.delete_id]
+    new_bodies = {cid: body for cid, body in old_bodies.items() if cid != payload.delete_id}
+    _enforce_locks(locked, payload.order_ids, old_bodies, new_order, new_bodies)
+    return {"order_ids": new_order, "clauses": [{"id": cid, "body": new_bodies[cid]} for cid in new_order]}
 
 
 @app.post("/api/merge")
@@ -400,6 +569,7 @@ def merge_clauses(payload: MergeIn):
       其他引用不动；已失效引用（目标不在草稿内）保持失效。
     """
     by_id = _validate_state(payload.order_ids, payload.clauses)
+    locked = _locked_ids(payload.locked_ids, by_id)
     errors: list[str] = []
     if payload.keep_id not in by_id:
         errors.append("合并目标条款不存在")
@@ -437,6 +607,14 @@ def merge_clauses(payload: MergeIn):
         merged.append({"id": clause.id, "body": MARKER_RE.sub(repoint, body)})
 
     new_order = [cid for cid in payload.order_ids if cid != payload.drop_id]
+    new_bodies = {c["id"]: c["body"] for c in merged}
+    _enforce_locks(
+        locked,
+        payload.order_ids,
+        {c.id: c.body for c in payload.clauses},
+        new_order,
+        new_bodies,
+    )
     return {"order_ids": new_order, "clauses": merged}
 
 
@@ -453,6 +631,7 @@ def split_clause(payload: SplitIn):
       所选段；其余引用保持不动；已失效引用保持失效。
     """
     by_id = _validate_state(payload.order_ids, payload.clauses)
+    locked = _locked_ids(payload.locked_ids, by_id)
     errors: list[str] = []
     if payload.split_id not in by_id:
         errors.append("被拆分的条款不存在")
@@ -518,6 +697,14 @@ def split_clause(payload: SplitIn):
         new_order.append(cid)
         if cid == payload.split_id:
             new_order.append(payload.new_id)
+    new_bodies = {c["id"]: c["body"] for c in split}
+    _enforce_locks(
+        locked,
+        payload.order_ids,
+        {c.id: c.body for c in payload.clauses},
+        new_order,
+        new_bodies,
+    )
     return {"order_ids": new_order, "clauses": split}
 
 
@@ -534,6 +721,7 @@ def duplicate_clauses(payload: DuplicateIn):
       身份不能复用，已有失效引用不能因此复活）。返回更新后的上界。
     """
     by_id = _validate_state(payload.order_ids, payload.clauses)
+    locked = _locked_ids(payload.locked_ids, by_id)
     errors: list[str] = []
     if not payload.selected_ids:
         errors.append("未选择要复制的条款")
@@ -598,6 +786,16 @@ def duplicate_clauses(payload: DuplicateIn):
         if cid == last_selected:
             new_order.extend(new_ids)
 
+    # 复制不改动任何既有条款的身份、正文与引用（副本另取全新身份），
+    # 因此对锁定集合永远不构成冲突；仍按实际结果核验一次以贯彻同一套保证
+    new_bodies = {c["id"]: c["body"] for c in clauses}
+    _enforce_locks(
+        locked,
+        payload.order_ids,
+        {c.id: c.body for c in payload.clauses},
+        new_order,
+        new_bodies,
+    )
     return {
         "order_ids": new_order,
         "clauses": clauses,
