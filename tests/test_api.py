@@ -1667,3 +1667,201 @@ def test_review_endpoints_validate_draft_and_records():
     snapshot = copy.deepcopy(payload)
     assert _check(state, [good]).status_code == 200
     assert payload == snapshot
+
+
+# --------------------------------------------------------------------------- #
+# 条款锁定（lock_ids 随写稿请求提交，后端按实际结果核验）
+# --------------------------------------------------------------------------- #
+LOCK_DOC = {
+    "order_ids": ["c1", "c2", "c3", "c4"],
+    "clauses": [
+        {"id": "c1", "body": "甲方在七日内交付设备"},
+        {"id": "c2", "body": "乙方按 [[c1]] 验收后付款"},
+        {"id": "c3", "body": "争议解决见 [[c2]]"},
+        {"id": "c4", "body": "争议提交仲裁"},
+    ],
+}
+
+
+def test_lock_ids_legacy_callers_unaffected():
+    # 旧调用不传 lock_ids：各写稿接口行为与无锁定一致
+    r = client.post("/api/save", json={**LOCK_DOC, "edit_id": "c2", "text": "改成别的"})
+    assert r.status_code == 200
+    r = client.post("/api/delete", json={**LOCK_DOC, "delete_id": "c2"})
+    assert r.status_code == 200
+    r = client.post(
+        "/api/merge", json={**LOCK_DOC, "keep_id": "c1", "drop_id": "c2"}
+    )
+    assert r.status_code == 200
+
+
+def test_lock_ids_duplicate_or_missing_or_bad_shape_rejected_422():
+    for bad in [["c2", "c2"], ["c9"], ["x2"]]:
+        r = client.post(
+            "/api/save", json={**LOCK_DOC, "edit_id": "c3", "text": "无关改动", "lock_ids": bad}
+        )
+        assert r.status_code == 422, (bad, r.text)
+        assert r.json()["detail"]["errors"]
+    # 空集合是显式的空集合：允许
+    r = client.post(
+        "/api/save", json={**LOCK_DOC, "edit_id": "c3", "text": "无关改动", "lock_ids": []}
+    )
+    assert r.status_code == 200
+
+
+def test_locked_clause_with_broken_ref_cannot_be_locked():
+    # 删除 c2 后 c3 正文留下失效引用 [[c2]]：c3 不能锁定
+    doc = {
+        "order_ids": ["c1", "c3", "c4"],
+        "clauses": [c for c in LOCK_DOC["clauses"] if c["id"] != "c2"],
+    }
+    r = client.post(
+        "/api/save", json={**doc, "edit_id": "c3", "text": "无关改动", "lock_ids": ["c3"]}
+    )
+    assert r.status_code == 422 and "含失效引用" in r.text
+    # 无失效引用的 c1 仍可锁定
+    r = client.post(
+        "/api/save", json={**doc, "edit_id": "c3", "text": "无关改动", "lock_ids": ["c1"]}
+    )
+    assert r.status_code == 200
+
+
+def test_save_blocked_when_locked_body_changes():
+    # 编辑锁定条款自身 -> 409，按顺序列出受影响锁定身份
+    r = client.post(
+        "/api/save", json={**LOCK_DOC, "edit_id": "c2", "text": "改过了", "lock_ids": ["c2"]}
+    )
+    assert r.status_code == 409
+    locked = r.json()["detail"]["locked"]
+    assert [v["id"] for v in locked] == ["c2"]
+    # 编辑未锁定、且不影响任何锁定条款的 c4 -> 允许
+    r = client.post(
+        "/api/save", json={**LOCK_DOC, "edit_id": "c4", "text": "仲裁改约定", "lock_ids": ["c2"]}
+    )
+    assert r.status_code == 200
+    # 改被锁定条款引用的目标正文（目标仍存续、引用关系不变）：不冻结被引条款正文 -> 允许
+    r = client.post(
+        "/api/save", json={**LOCK_DOC, "edit_id": "c1", "text": "甲改为三十日交付", "lock_ids": ["c2"]}
+    )
+    assert r.status_code == 200
+
+
+def test_delete_blocked_even_when_target_unlocked():
+    # 删除对象 c1 未锁定，但锁定条款 c2 有效引用它 -> 整次拒绝
+    r = client.post("/api/delete", json={**LOCK_DOC, "delete_id": "c1", "lock_ids": ["c2"]})
+    assert r.status_code == 409
+    locked = r.json()["detail"]["locked"]
+    assert [v["id"] for v in locked] == ["c2"]
+    assert any("引用将失效" in reason for v in locked for reason in v["reasons"])
+
+    # 删除被锁定的 c2，同时 c3 引用它：c3（在结果顺序中）在前，c2（消失）在最后
+    r = client.post("/api/delete", json={**LOCK_DOC, "delete_id": "c2", "lock_ids": ["c3", "c2"]})
+    assert r.status_code == 409
+    locked = r.json()["detail"]["locked"]
+    assert [v["id"] for v in locked] == ["c3", "c2"]
+
+    # 删除与锁定集合完全无关的 c4 -> 允许
+    r = client.post("/api/delete", json={**LOCK_DOC, "delete_id": "c4", "lock_ids": ["c2"]})
+    assert r.status_code == 200
+    assert r.json()["deleted_id"] == "c4"
+
+
+def test_merge_blocked_for_locked_drop_and_repointed_refs():
+    # 锁 c3：合并把 c3 对 c2 的引用统一改指 c1（正文改动 + 引用改指）-> 拒绝
+    r = client.post(
+        "/api/merge",
+        json={**LOCK_DOC, "keep_id": "c1", "drop_id": "c2", "lock_ids": ["c3"]},
+    )
+    assert r.status_code == 409
+    locked = r.json()["detail"]["locked"]
+    assert [v["id"] for v in locked] == ["c3"]
+    assert any("改指" in reason for reason in locked[0]["reasons"])
+
+    # 锁 c2（被并入而消失）与 c3（引用改指）：按结果顺序 c3 在前、c2 在最后
+    r = client.post(
+        "/api/merge",
+        json={**LOCK_DOC, "keep_id": "c1", "drop_id": "c2", "lock_ids": ["c2", "c3"]},
+    )
+    assert r.status_code == 409
+    assert [v["id"] for v in r.json()["detail"]["locked"]] == ["c3", "c2"]
+
+    # 锁无关条款 c4：合并 c1+c2 不影响它（c4 正文无引用、身份存续）-> 允许
+    r = client.post(
+        "/api/merge",
+        json={**LOCK_DOC, "keep_id": "c1", "drop_id": "c2", "lock_ids": ["c4"]},
+    )
+    assert r.status_code == 200
+
+
+def test_split_blocked_for_locked_split_clause_or_back_repoint():
+    # 拆分被锁条款自身 c1（前段只剩正文前缀）-> 拒绝
+    r = client.post(
+        "/api/split",
+        json={
+            **LOCK_DOC,
+            "split_id": "c1",
+            "offset": 2,
+            "new_id": "c5",
+            "refs_to": "front",
+            "lock_ids": ["c1"],
+        },
+    )
+    assert r.status_code == 409
+    assert [v["id"] for v in r.json()["detail"]["locked"]] == ["c1"]
+
+    # 锁 c2（引用 c1）：引用落前段时 c2 正文 [[c1]] 不变 -> 允许
+    r = client.post(
+        "/api/split",
+        json={
+            **LOCK_DOC,
+            "split_id": "c1",
+            "offset": 2,
+            "new_id": "c5",
+            "refs_to": "front",
+            "lock_ids": ["c2"],
+        },
+    )
+    assert r.status_code == 200, r.text
+
+    # 引用落后段：c2 正文 [[c1]] 改成 [[c5]] -> 拒绝
+    r = client.post(
+        "/api/split",
+        json={
+            **LOCK_DOC,
+            "split_id": "c1",
+            "offset": 2,
+            "new_id": "c5",
+            "refs_to": "back",
+            "lock_ids": ["c2"],
+        },
+    )
+    assert r.status_code == 409
+    assert [v["id"] for v in r.json()["detail"]["locked"]] == ["c2"]
+
+
+def test_duplicate_always_allowed_copies_not_locked():
+    # 锁定全部现存条款，复制仍允许（原条款身份 / 顺序 / 正文均不变）
+    r = client.post(
+        "/api/duplicate",
+        json={**LOCK_DOC, "selected_ids": ["c1"], "next_id": 4, "lock_ids": ["c1", "c2", "c3", "c4"]},
+    )
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["next_id"] == 5
+    assert "c5" in data["order_ids"]
+    # 复制时锁定集合含不存在身份仍 422
+    r = client.post(
+        "/api/duplicate",
+        json={**LOCK_DOC, "selected_ids": ["c1"], "next_id": 4, "lock_ids": ["c9"]},
+    )
+    assert r.status_code == 422
+
+
+def test_reorder_allowed_under_lock():
+    # 纯重排不改内部正文与身份：预览不校验锁定（也不接受 lock_ids），始终可用
+    r = client.post(
+        "/api/preview",
+        json={**LOCK_DOC, "order_ids": ["c4", "c3", "c2", "c1"]},
+    )
+    assert r.status_code == 200
+    assert r.json()["items"][0]["id"] == "c4"

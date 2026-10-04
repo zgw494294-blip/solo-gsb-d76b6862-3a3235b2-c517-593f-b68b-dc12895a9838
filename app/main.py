@@ -65,7 +65,7 @@
 校稿存档（``GET /api/archive`` / ``PUT /api/archive``）：
 - 服务端用 SQLite 保存**一个共享槽**的完整快照：不可变原稿基线、当前顺序、内部正文
   （``order_ids`` / ``clauses``，内部形态 ``[[c3]]``）与已用身份上界（``id_counter``）；
-  不含勾选、编辑中正文或拆分选择等临时状态。数据库文件自动创建（表不存在时自动建表），
+  不含勾选、编辑中正文、拆分选择或条款锁定等临时状态。数据库文件自动创建（表不存在时自动建表），
   容器经数据卷持久化，刷新页面或重建容器后均可恢复继续校订。
 - 读取返回版本与快照：空槽版本为 0、快照为 null。
 - 保存携带最近读取或保存成功得到的版本：仅与槽内当前版本一致时整份写入并加 1；
@@ -73,6 +73,18 @@
 - 快照沿用草稿校验：基线与现稿均须通过既有状态校验，身份上界须覆盖基线、现稿及
   失效引用中出现的全部身份号（恢复后继续拆分 / 复制不会复用旧身份）；
   非法快照（422）或写入失败（500）时旧存档一律保留。
+
+条款锁定（``lock_ids``，随写稿请求提交）：
+- 锁定集合仅存调用方（页面）内存，不进存档快照、不改存档协议；由后端按**操作后的实际结果**
+  核验，而不是只看操作对象是否在集合中。
+- 集合重复、含形态非法或草稿中不存在的身份时整次拒绝（422）；旧调用不传 ``lock_ids``
+  仍按原规则处理（等同没有任何锁定）。
+- 保存、删除、合并、拆分只要改变任一锁定条款（稳定身份消失、内部正文逐字变化）或使锁定
+  条款的有效引用失去现存目标，即整次拒绝（409）：草稿、身份上界与复核记录均不变；
+  按结果当前顺序逐个列出受影响的锁定身份及原因。**重排与编号变化允许**；锁定不冻结
+  被引用条款的正文（只保证引用目标仍存在）。复制始终允许，副本取得新身份、不锁定。
+- 含失效引用的条款不能锁定（该状态无法保证"有效引用的目标存续"）；锁定后引用一旦失效，
+  造成失效的写稿操作即按上条整次拒绝。
 """
 
 from __future__ import annotations
@@ -126,6 +138,14 @@ class SaveIn(BaseModel):
     clauses: list[ClauseIn]
     edit_id: str
     text: str  # 编辑器中的正文（数字引用）
+    lock_ids: list[str] | None = None  # 本页锁定集合；None 表示旧调用（按无锁定处理）
+
+
+class DeleteIn(BaseModel):
+    order_ids: list[str]
+    clauses: list[ClauseIn]
+    delete_id: str  # 被删除条款的稳定身份
+    lock_ids: list[str] | None = None  # 同 SaveIn.lock_ids
 
 
 class MergeIn(BaseModel):
@@ -133,6 +153,7 @@ class MergeIn(BaseModel):
     clauses: list[ClauseIn]
     keep_id: str  # 合并后沿用的身份（当前显示顺序中较前的一条）
     drop_id: str  # 被并入并移除的一条（当前显示顺序中较后的一条）
+    lock_ids: list[str] | None = None
 
 
 class SplitIn(BaseModel):
@@ -142,6 +163,7 @@ class SplitIn(BaseModel):
     offset: int  # 分界：已保存正文中的字符位置（按 Unicode 码位计）
     new_id: str  # 后段的新身份（本草稿从未使用过的 id）
     refs_to: str  # 原指向被拆条款的引用落到 "front"（前段）还是 "back"（后段）
+    lock_ids: list[str] | None = None
 
 
 class DiffIn(BaseModel):
@@ -155,6 +177,7 @@ class DuplicateIn(BaseModel):
     clauses: list[ClauseIn]
     selected_ids: list[str]  # 要复制的条款身份；按当前显示顺序复制整组
     next_id: int  # 已用身份上界：副本新身份从 next_id + 1 起依次分配
+    lock_ids: list[str] | None = None  # 复制不影响任何条款：锁定集合仅校验，不约束复制
 
 
 class ReferrersIn(StateIn):
@@ -347,6 +370,118 @@ def resolve_body(body: str, pos_by_id: dict[str, int]) -> tuple[str, list[dict]]
     return "".join(out), broken
 
 
+def _normalize_lock_ids(
+    lock_ids: list[str] | None, by_id: dict[str, ClauseIn]
+) -> list[str] | None:
+    """校验并归一化调用方提交的锁定集合。
+
+    - ``None``（旧调用不传）按无锁定处理；空列表是显式的空集合。
+    - 身份形态非法、重复或在草稿中不存在：整次 422。
+    """
+    if lock_ids is None:
+        return None
+    errors: list[str] = []
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for lock_id in lock_ids:
+        if not isinstance(lock_id, str) or not ID_RE.match(lock_id):
+            errors.append(f"锁定身份非法：{lock_id}")
+            continue
+        if lock_id in seen:
+            errors.append(f"锁定身份重复：{lock_id}")
+            continue
+        seen.add(lock_id)
+        if lock_id not in by_id:
+            errors.append(f"锁定身份在当前草稿中不存在：{lock_id}")
+            continue
+        # 含失效引用的条款不能锁定：无法保证"有效引用的目标存续"，
+        # 也避免锁定集合在语义上自相矛盾
+        if any(m.group(1) not in by_id for m in MARKER_RE.finditer(by_id[lock_id].body)):
+            errors.append(f"条款 {lock_id} 含失效引用，修复前不能锁定")
+        normalized.append(lock_id)
+    if errors:
+        raise HTTPException(422, detail={"errors": errors})
+    return normalized
+
+
+def _lock_violations(
+    old_by: dict[str, ClauseIn],
+    new_order: list[str],
+    new_by: dict[str, ClauseIn],
+    lock_ids: list[str],
+    repointed: dict[str, str] | None = None,
+) -> list[dict]:
+    """按操作后的实际结果核验锁定集合，返回受影响锁定身份（按结果当前顺序）及原因。
+
+    每个锁定身份保护：稳定身份存续、内部正文逐字不变、操作前其正文中**有效引用**
+    （目标仍在草稿内的 ``[[cX]]``，去重）的引用关系——结果中标记仍须指向同一目标。
+    重排与编号变化不报；被引用条款的正文变化不报（锁定不冻结被引用条款正文）。
+
+    ``repointed`` 给出被改指的引用（合并时 drop→keep、拆分落后段时 split→new）：
+    目标身份随合并消失但引用已改指的，报"引用被改指"而非"引用将失效"。
+    """
+    repointed = repointed or {}
+    reasons: dict[str, list[str]] = {}
+
+    def add(lock_id: str, reason: str) -> None:
+        bucket = reasons.setdefault(lock_id, [])
+        if reason not in bucket:
+            bucket.append(reason)
+
+    for lock_id in lock_ids:
+        old_clause = old_by[lock_id]
+        new_clause = new_by.get(lock_id)
+        if new_clause is None:
+            add(lock_id, "稳定身份消失：该锁定条款被删除或经合并移除")
+            continue
+        if new_clause.body != old_clause.body:
+            add(lock_id, "内部正文被改动（锁定条款的正文须逐字保持）")
+        # 操作前的有效引用（目标仍在草稿内、去重）在结果中标记必须仍指向同一目标
+        old_targets = {
+            m.group(1) for m in MARKER_RE.finditer(old_clause.body) if m.group(1) in old_by
+        }
+        for ref_id in sorted(old_targets, key=lambda x: int(x[1:])):
+            # 目标仍存续且标记仍指向它：正常（删除会在正文里留下失效标记 [[cX]]，
+            # 故必须先确认目标仍在——标记残留而目标消失正是"引用将失效"）
+            if ref_id in new_by and f"[[{ref_id}]]" in new_clause.body:
+                continue
+            new_target = repointed.get(ref_id)
+            if new_target is not None and f"[[{new_target}]]" in new_clause.body:
+                add(lock_id, f"有效引用 [[{ref_id}]] 被统一改指 [[{new_target}]]，引用关系发生变化")
+            elif ref_id not in new_by:
+                add(
+                    lock_id,
+                    f"有效引用 [[{ref_id}]] 的目标条款被删除或经合并移除，该引用将失效",
+                )
+            else:
+                add(lock_id, f"有效引用 [[{ref_id}]] 被改动，引用关系发生变化")
+
+    # 按结果当前顺序列出受影响的锁定身份；身份已消失（不在结果顺序中）的排在最后
+    ordered: list[dict] = []
+    emitted: set[str] = set()
+    for clause_id in new_order:
+        if clause_id in reasons:
+            ordered.append(
+                {"id": clause_id, "original": int(clause_id[1:]), "reasons": reasons[clause_id]}
+            )
+            emitted.add(clause_id)
+    for lock_id in lock_ids:
+        if lock_id in reasons and lock_id not in emitted:
+            ordered.append(
+                {"id": lock_id, "original": int(lock_id[1:]), "reasons": reasons[lock_id]}
+            )
+    return ordered
+
+
+def _raise_lock_violations(violations: list[dict]) -> None:
+    """锁定违例整次拒绝（409）：草稿、上界与复核均不变。"""
+    errors: list[str] = ["存在锁定条款，本次操作整次拒绝，受影响的锁定条款如下："]
+    for v in violations:
+        for reason in v["reasons"]:
+            errors.append(f"锁定身份 {v['id']}（原第 {v['original']} 条）：{reason}")
+    raise HTTPException(409, detail={"errors": errors, "locked": violations})
+
+
 # --------------------------------------------------------------------------- #
 # 接口
 # --------------------------------------------------------------------------- #
@@ -362,6 +497,7 @@ def import_doc(payload: ImportIn):
 def save_clause(payload: SaveIn):
     """保存对某条正文的编辑：数字引用按**保存当刻**显示编号绑定。"""
     by_id = _validate_state(payload.order_ids, payload.clauses)
+    lock_ids = _normalize_lock_ids(payload.lock_ids, by_id)
     if payload.edit_id not in by_id:
         raise HTTPException(422, detail={"errors": ["被编辑的条款不存在"]})
 
@@ -386,7 +522,44 @@ def save_clause(payload: SaveIn):
         return f"[[{target_id}]]"
 
     internal = MARKER_RE.sub(bind, text)
+
+    # 锁定核验按保存后的实际结果（编辑只改一条正文，顺序与身份集合不变）
+    if lock_ids is not None:
+        new_by = dict(by_id)
+        new_by[payload.edit_id] = ClauseIn(id=payload.edit_id, body=internal)
+        violations = _lock_violations(by_id, payload.order_ids, new_by, lock_ids)
+        if violations:
+            _raise_lock_violations(violations)
+
     return {"id": payload.edit_id, "body": internal}
+
+
+@app.post("/api/delete")
+def delete_clause(payload: DeleteIn):
+    """删除一条条款（前端写稿提交协调层的删除入口经 HTTP 处理）。
+
+    删除本身是本地操作，但锁定保护要求"即使操作对象未锁定，只要删除会改变任一锁定
+    条款或使其引用失效，就整次拒绝"，因此删除与其他写稿一样提交后端核验：
+    被删身份被锁定，或锁定条款的有效引用指向它，都按结果当前顺序列出受影响锁定身份
+    与原因（409），调用方草稿不变。删除本身不做额外状态校验之外的改写。
+    """
+    by_id = _validate_state(payload.order_ids, payload.clauses)
+    lock_ids = _normalize_lock_ids(payload.lock_ids, by_id)
+    if payload.delete_id not in by_id:
+        raise HTTPException(422, detail={"errors": [f"被删除的条款不存在：{payload.delete_id}"]})
+
+    new_order = [cid for cid in payload.order_ids if cid != payload.delete_id]
+    new_clauses = [
+        {"id": c.id, "body": c.body}
+        for c in payload.clauses
+        if c.id != payload.delete_id
+    ]
+    if lock_ids is not None:
+        new_by = {cid: by_id[cid] for cid in new_order}
+        violations = _lock_violations(by_id, new_order, new_by, lock_ids)
+        if violations:
+            _raise_lock_violations(violations)
+    return {"order_ids": new_order, "clauses": new_clauses, "deleted_id": payload.delete_id}
 
 
 @app.post("/api/merge")
@@ -400,6 +573,7 @@ def merge_clauses(payload: MergeIn):
       其他引用不动；已失效引用（目标不在草稿内）保持失效。
     """
     by_id = _validate_state(payload.order_ids, payload.clauses)
+    lock_ids = _normalize_lock_ids(payload.lock_ids, by_id)
     errors: list[str] = []
     if payload.keep_id not in by_id:
         errors.append("合并目标条款不存在")
@@ -437,6 +611,16 @@ def merge_clauses(payload: MergeIn):
         merged.append({"id": clause.id, "body": MARKER_RE.sub(repoint, body)})
 
     new_order = [cid for cid in payload.order_ids if cid != payload.drop_id]
+
+    # 锁定核验按合并后的实际结果：较后身份消失、较前正文拼接、drop 引用改指都会命中
+    if lock_ids is not None:
+        new_by = {item["id"]: ClauseIn(**item) for item in merged}
+        violations = _lock_violations(
+            by_id, new_order, new_by, lock_ids, repointed={payload.drop_id: payload.keep_id}
+        )
+        if violations:
+            _raise_lock_violations(violations)
+
     return {"order_ids": new_order, "clauses": merged}
 
 
@@ -453,6 +637,7 @@ def split_clause(payload: SplitIn):
       所选段；其余引用保持不动；已失效引用保持失效。
     """
     by_id = _validate_state(payload.order_ids, payload.clauses)
+    lock_ids = _normalize_lock_ids(payload.lock_ids, by_id)
     errors: list[str] = []
     if payload.split_id not in by_id:
         errors.append("被拆分的条款不存在")
@@ -518,6 +703,19 @@ def split_clause(payload: SplitIn):
         new_order.append(cid)
         if cid == payload.split_id:
             new_order.append(payload.new_id)
+
+    # 锁定核验按拆分后的实际结果：被拆条款自身被锁（前段正文被切走、自引用可能改指）
+    # 或其他锁定条款引用被拆条款且引用统一改指后段（其正文变化）都会整次拒绝；
+    # 引用改指前段时正文标记不变，允许。
+    if lock_ids is not None:
+        new_by = {item["id"]: ClauseIn(**item) for item in split}
+        repointed = {payload.split_id: payload.new_id} if payload.refs_to == "back" else {}
+        violations = _lock_violations(
+            by_id, new_order, new_by, lock_ids, repointed=repointed
+        )
+        if violations:
+            _raise_lock_violations(violations)
+
     return {"order_ids": new_order, "clauses": split}
 
 
@@ -534,6 +732,9 @@ def duplicate_clauses(payload: DuplicateIn):
       身份不能复用，已有失效引用不能因此复活）。返回更新后的上界。
     """
     by_id = _validate_state(payload.order_ids, payload.clauses)
+    # 复制不改变任何现存条款的身份、顺序与正文：锁定集合只做形态/存在性校验
+    # （重复、含不存在身份仍 422），不会因锁定而拒绝复制；副本取得新身份、不锁定。
+    _normalize_lock_ids(payload.lock_ids, by_id)
     errors: list[str] = []
     if not payload.selected_ids:
         errors.append("未选择要复制的条款")

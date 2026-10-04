@@ -23,8 +23,8 @@ const state = {
   previewFresh: false, // 页面预览是否已追上最新草稿；未追上时禁止下载与合并
   importing: false, // /api/import 在途（期间忽略重复提交）
   saving: false, // /api/save 在途
-  writing: null, // 在途写稿提交（null | "merge" | "split" | "duplicate"）：合并 / 拆分 / 复制共用的
-  // 提交协调层状态；提交期间阻止其他改稿与重复提交，但允许重新导入
+  writing: null, // 在途写稿提交（null | "merge" | "split" | "duplicate" | "delete"）：合并 / 拆分 / 复制 / 删除共用的
+  // 提交协调层状态；提交期间阻止其他改稿与重复提交，但允许重新导入与切换条款锁定
   exporting: false, // /api/export 在途
   baseline: null, // 成功导入后不可变的原稿基线（{ order_ids, clauses }，深拷贝）；重新导入清空
   diffOpen: false, // 原稿对照面板是否展开
@@ -49,6 +49,8 @@ const state = {
   archiveError: null, // 最近一次存档操作失败的错误信息（数组）
   archiveConflict: null, // 最近一次 409 冲突时服务端的当前版本（数字）；读取最新版本或保存 / 恢复成功后清空
   archiveNotice: null, // 存档提示（如"已读取最新版本 v3"、"服务端暂无存档"）
+  lockIds: [], // 条款锁定集合（稳定身份）：仅存本页内存，随写稿请求提交、由后端按实际结果核验；
+  // 换稿（重新导入 / 恢复存档）或刷新清空，不进存档快照；锁定切换不改草稿、不推进修订号、不改复核
 };
 
 const MAX_CLAUSES = 40; // 与后端 MAX_LINES 一致：拆分后总数不能超过它
@@ -160,6 +162,209 @@ function snapshot() {
     order_ids: state.orderIds,
     clauses: state.clauses.map((c) => ({ id: c.id, body: c.body })),
   };
+}
+
+// --------------------------------------------------------------------------- //
+// 条款锁定（集合仅存本页内存；随写稿请求提交，由后端按实际结果核验）
+// --------------------------------------------------------------------------- //
+// 当前锁定集合的快照：随每个写稿请求提交。空数组是显式的空集合（与旧调用不传不同，
+// 但前端始终传），后端据此核验。
+function lockPayload() {
+  return state.lockIds.slice();
+}
+
+// 切换某条条款的锁定 / 解锁。纯本页内存操作：
+// - 不改正文、顺序与身份上界，不推进修订号，不触发预览 / 对照 / 引用重查；
+// - 不改复核状态（锁定切换不改复核），也不影响存档的未存档标记；
+// - 含失效引用的条款不能锁定（按钮已禁用，这里再兜底）；解锁始终允许；
+// - 写稿提交等待期间也可切换（spec 明确允许），下一个写稿请求携带最新集合。
+function toggleLock(id) {
+  const idx = state.lockIds.indexOf(id);
+  if (idx >= 0) {
+    state.lockIds.splice(idx, 1);
+  } else {
+    if (clauseHasBrokenRef(id)) return; // 含失效引用的条款不能锁定
+    state.lockIds.push(id);
+  }
+  syncLockTags();
+}
+
+// 按当前已保存草稿判断某条款正文是否含失效引用（内部形态 [[cX]] 中目标已不在草稿）
+function clauseHasBrokenRef(id) {
+  const clause = state.clauses.find((c) => c.id === id);
+  if (!clause) return false;
+  const alive = new Set(state.orderIds);
+  return Array.from(clause.body.matchAll(/\[\[(c\d+)\]\]/g)).some((m) => !alive.has(m[1]));
+}
+
+// 卡片重建后锁定标记与按钮由模板渲染；这里处理点击「锁定 / 解锁」后不重建卡片的即时更新
+function syncLockTags() {
+  const locked = new Set(state.lockIds);
+  document.querySelectorAll(".card").forEach((card) => {
+    const isLocked = locked.has(card.dataset.id);
+    card.classList.toggle("locked", isLocked);
+    const tag = card.querySelector('[data-role="lock-tag"]');
+    if (tag) tag.hidden = !isLocked;
+    // 不重建整张卡片，仅同步改稿入口的禁用态（锁定不影响重排按钮与勾选）；
+    // 任一卡片处于编辑 / 拆分选择中时，其他卡的改稿入口仍按既有规则全部禁用
+    const otherBusy = state.editingId !== null || state.splittingId !== null;
+    const editBtn = card.querySelector('[data-action="edit"]');
+    const delBtn = card.querySelector('[data-action="delete"]');
+    const splitBtn = card.querySelector('[data-action="split"]');
+    if (editBtn) editBtn.disabled = isLocked || otherBusy;
+    if (delBtn) delBtn.disabled = isLocked || otherBusy;
+    if (splitBtn) splitBtn.disabled = isLocked || otherBusy || state.orderIds.length >= MAX_CLAUSES;
+    const lockBtn = card.querySelector('[data-action="lock"]');
+    if (lockBtn) {
+      lockBtn.textContent = isLocked ? "解锁" : "锁定";
+      lockBtn.classList.toggle("is-locked", isLocked);
+      // 解锁后若条款含失效引用，重新锁定仍应被阻止；解锁态按钮始终可用
+      lockBtn.disabled = !isLocked && clauseHasBrokenRef(card.dataset.id);
+    }
+  });
+}
+
+// 内部正文中的引用标记（含失效引用），返回 [[cX]] 中目标身份的去重列表
+function refTargets(body) {
+  const out = [];
+  const seen = new Set();
+  for (const m of body.matchAll(/\[\[(c\d+)\]\]/g)) {
+    if (!seen.has(m[1])) {
+      seen.add(m[1]);
+      out.push(m[1]);
+    }
+  }
+  return out;
+}
+
+// 在一份写稿结果（接口回包形态：{ order_ids, clauses }）上按给定锁定集合核验。
+// 与后端 _lock_violations 同规则：保护稳定身份存续、内部正文逐字不变、操作前有效引用
+// （目标仍在草稿内）的引用关系——结果中标记仍须指向同一目标；重排与编号变化不报；
+// 被引用条款正文变化不报。repointed 为统一改指映射（合并 drop→keep、拆分落后段
+// split→new），用于把"改指"与"目标删除导致失效"区分开。
+// 返回 [{ id, reasons }]，顺序与结果 order_ids 一致，消失身份排最后。
+function lockViolationsInResult(result, lockIds, repointed) {
+  if (!lockIds || !lockIds.length) return [];
+  repointed = repointed || {};
+  const oldById = new Map(state.clauses.map((c) => [c.id, c.body]));
+  const newById = new Map(result.clauses.map((c) => [c.id, c.body]));
+  const reasons = new Map();
+  const add = (id, reason) => {
+    const list = reasons.get(id) || [];
+    if (!list.includes(reason)) list.push(reason);
+    reasons.set(id, list);
+  };
+  for (const lockId of lockIds) {
+    const oldBody = oldById.get(lockId);
+    if (oldBody === undefined) continue;
+    const newBody = newById.get(lockId);
+    if (newBody === undefined) {
+      add(lockId, "稳定身份消失：该锁定条款被删除或经合并移除");
+      continue;
+    }
+    if (newBody !== oldBody) {
+      add(lockId, "内部正文被改动（锁定条款的正文须逐字保持）");
+    }
+    const oldTargets = refTargets(oldBody)
+      .filter((r) => oldById.has(r))
+      .sort((a, b) => parseInt(a.slice(1), 10) - parseInt(b.slice(1), 10));
+    for (const refId of oldTargets) {
+      // 目标仍存续且标记仍指向它：正常（删除会在正文留下失效标记 [[cX]]，
+      // 必须先确认目标仍在——标记残留而目标消失正是"引用将失效"）
+      if (newById.has(refId) && newBody.includes(`[[${refId}]]`)) continue;
+      const newTarget = repointed[refId];
+      if (newTarget !== undefined && newBody.includes(`[[${newTarget}]]`)) {
+        add(lockId, `有效引用 [[${refId}]] 被统一改指 [[${newTarget}]]，引用关系发生变化`);
+      } else if (!newById.has(refId)) {
+        add(lockId, `有效引用 [[${refId}]] 的目标条款被删除或经合并移除，该引用将失效`);
+      } else {
+        add(lockId, `有效引用 [[${refId}]] 被改动，引用关系发生变化`);
+      }
+    }
+  }
+  const ordered = [];
+  const emitted = new Set();
+  for (const cid of result.order_ids) {
+    if (reasons.has(cid)) {
+      ordered.push({ id: cid, reasons: reasons.get(cid) });
+      emitted.add(cid);
+    }
+  }
+  for (const lockId of lockIds) {
+    if (reasons.has(lockId) && !emitted.has(lockId)) {
+      ordered.push({ id: lockId, reasons: reasons.get(lockId) });
+    }
+  }
+  return ordered;
+}
+
+// 保存（/api/save）的回包只有 { id, body }：构造结果草稿后复用统一核验
+function lockViolationsAfterSave(editId, body, lockIds) {
+  return lockViolationsInResult(
+    {
+      order_ids: state.orderIds,
+      clauses: state.clauses.map((c) =>
+        c.id === editId ? { id: c.id, body } : { id: c.id, body: c.body },
+      ),
+    },
+    lockIds,
+  );
+}
+
+// 把本地核验出的违例归一成与后端 409 同形态的可展示错误
+function formatLockViolations(violations) {
+  return [
+    "存在锁定条款，本次操作整次拒绝，受影响的锁定条款如下：",
+    ...violations.map(
+      (v) => `锁定身份 ${v.id}（原第 ${v.id.slice(1)} 条）：${v.reasons.join("；")}`,
+    ),
+  ];
+}
+
+// 合并的本地预检：在构造合并结果上复用统一核验（权威核验仍由服务端按实际结果执行）
+function mergeLockPrecheck(keepId, dropId) {
+  if (!state.lockIds.length) return [];
+  const clauses = [];
+  for (const c of state.clauses) {
+    if (c.id === dropId) continue;
+    let body = c.body;
+    if (c.id === keepId) {
+      const drop = state.clauses.find((x) => x.id === dropId);
+      body = `${body}；${drop.body}`;
+    }
+    body = body.replaceAll(`[[${dropId}]]`, `[[${keepId}]]`);
+    clauses.push({ id: c.id, body });
+  }
+  const orderIds = state.orderIds.filter((x) => x !== dropId);
+  return lockViolationsInResult(
+    { order_ids: orderIds, clauses },
+    state.lockIds,
+    { [dropId]: keepId },
+  );
+}
+
+// 拆分的本地预检：镜像后端 /api/split 的结果构造后复用统一核验
+function splitLockPrecheck(splitId, offset, newId, refsTo) {
+  if (!state.lockIds.length) return [];
+  const repoint = (body) =>
+    refsTo === "back" ? body.replaceAll(`[[${splitId}]]`, `[[${newId}]]`) : body;
+  const src = state.clauses.find((c) => c.id === splitId);
+  const clauses = [];
+  for (const c of state.clauses) {
+    if (c.id === splitId) {
+      clauses.push({ id: c.id, body: repoint(src.body.slice(0, offset)) });
+      clauses.push({ id: newId, body: repoint(src.body.slice(offset)) });
+    } else {
+      clauses.push({ id: c.id, body: repoint(c.body) });
+    }
+  }
+  const orderIds = [];
+  for (const cid of state.orderIds) {
+    orderIds.push(cid);
+    if (cid === splitId) orderIds.push(newId);
+  }
+  const repointed = refsTo === "back" ? { [splitId]: newId } : {};
+  return lockViolationsInResult({ order_ids: orderIds, clauses }, state.lockIds, repointed);
 }
 
 // 原稿基线：成功导入那一刻的草稿快照。基线一经建立不再随改稿变动，
@@ -606,6 +811,8 @@ function installArchive(snap, version) {
   state.writing = null;
   state.saving = false;
   state.exporting = false;
+  // 锁定仅存本页内存：恢复存档即清空（存档快照不含锁定集合，存档协议不变）
+  state.lockIds = [];
   // 复核记录仅存本页内存：成功恢复存档即清空（存档快照本就不含复核记录）；
   // 在途复核稿下载的响应与收尾一律作废
   state.reviews = [];
@@ -677,6 +884,8 @@ importBtn.addEventListener("click", async () => {
     state.splitRefsTo = "front";
     state.writing = null; // 新草稿无写稿在途；上一草稿的在途写稿因世代不符，其响应与收尾一律落空
     state.idCounter = data.clauses.length; // 导入身份为 c1..cN，拆分/复制新身份从 N+1 起
+    // 锁定仅存本页内存：换稿即清空（不进存档快照，存档协议不变）
+    state.lockIds = [];
     // 成功导入建立不可变原稿基线（深拷贝），同时收起并清空旧对照
     state.baseline = {
       order_ids: state.orderIds.slice(),
@@ -740,6 +949,7 @@ $("#reimport-btn").addEventListener("click", () => {
   state.splitOffset = null;
   state.splitRefsTo = "front";
   state.idCounter = 0;
+  state.lockIds = []; // 锁定仅存本页内存：重新导入即清空
   state.baseline = null; // 重新导入清空原稿基线，成功导入后再建立
   state.diffOpen = false;
   state.diffData = null;
@@ -875,6 +1085,7 @@ async function renderPreview(epoch, rev, seq) {
       "card" +
       (item.broken.length ? " source-broken" : "") +
       (state.pickIds.includes(item.id) ? " selected" : "") +
+      (state.lockIds.includes(item.id) ? " locked" : "") +
       (state.refsId === item.id ? " refs-open" : "");
     li.id = `card-${item.id}`;
     li.dataset.id = item.id;
@@ -882,6 +1093,10 @@ async function renderPreview(epoch, rev, seq) {
     const isEditing = state.editingId === item.id;
     const isSplitting = state.splittingId === item.id;
     const locked = state.editingId || state.splittingId; // 编辑或拆分选择进行中：锁定其他操作
+    const isClLocked = state.lockIds.includes(item.id); // 该条款已定稿锁定
+    // 含失效引用的条款不能锁定（后端同样拒绝）；锁定后卡片自身的改稿入口禁用，
+    // 但重排（↑↓/拖拽）、勾选仍可用——锁定保护身份、内部正文与有效引用目标，不冻结编号
+    const lockable = item.broken.length === 0;
     const atMax = state.orderIds.length >= MAX_CLAUSES;
     li.innerHTML = `
       <div class="card-head">
@@ -892,6 +1107,9 @@ async function renderPreview(epoch, rev, seq) {
         <span class="num">${item.display}</span>
         <span class="orig">（原第 ${item.original} 条）</span>
         ${item.broken.length ? '<span class="warn-tag">含失效引用</span>' : ""}
+        <span class="lock-tag" data-role="lock-tag" title="已定稿：身份、内部正文与有效引用目标受保护，重排与编号变化允许"${
+          isClLocked ? "" : " hidden"
+        }>🔒 已锁定</span>
         <span class="review-tag" data-role="review-tag" title="本条及其全部可达引用条款的当前正文已复核"${
           state.reviews.some((r) => r.id === item.id) ? "" : " hidden"
         }>已复核</span>
@@ -905,22 +1123,45 @@ async function renderPreview(epoch, rev, seq) {
                  <button data-action="down" ${
                    item.display === data.items.length || locked ? "disabled" : ""
                  }>↓</button>
-                 <button data-action="edit" ${locked ? "disabled" : ""}>编辑正文</button>
+                 <button data-action="edit" ${
+                   locked || isClLocked ? "disabled" : ""
+                 }${
+                   isClLocked ? ' title="已定稿锁定：解锁后才能编辑"' : ""
+                 }>编辑正文</button>
                  <button data-action="refs" ${
                    locked ? "disabled" : ""
                  } title="列出直接引用本条与仅经多级引用可达本条的条款">${
                    state.refsId === item.id ? "收起引用" : "谁引用"
                  }</button>
-                 <button data-action="split" ${locked || atMax ? "disabled" : ""}
+                 <button data-action="split" ${
+                   locked || isClLocked || atMax ? "disabled" : ""
+                 }
                    title="${
-                     atMax
-                       ? `条款总数已达 ${MAX_CLAUSES} 条上限，不能再拆分`
-                       : "在选定分界处把本条已保存正文拆成前后两条"
+                     isClLocked
+                       ? "已定稿锁定：解锁后才能拆分"
+                       : atMax
+                         ? `条款总数已达 ${MAX_CLAUSES} 条上限，不能再拆分`
+                         : "在选定分界处把本条已保存正文拆成前后两条"
                    }">拆分</button>
                  <button data-action="review" ${locked ? "disabled" : ""}
                    title="记录本条已保存正文及其全部可达引用条款的当前正文；此后相关正文或目标存续变化会清除该复核">复核</button>
+                 <button data-action="lock" class="${
+                   isClLocked ? "is-locked" : ""
+                 }" ${
+                   // 写稿等待时仍可切换锁定（纯本页内存操作）；编辑 / 拆分选择中卡片不渲染此按钮；
+                   // 含失效引用的条款不能锁定，解锁始终允许（如修复期间想解除）
+                   !isClLocked && !lockable ? "disabled" : ""
+                 } title="${
+                   isClLocked
+                     ? "解除定稿锁定"
+                     : lockable
+                       ? "定稿锁定：保存、删除、合并、拆分不得改变本条身份、内部正文或使其有效引用失效；重排不受限"
+                       : "该条款含失效引用，修复后才能锁定"
+                 }">${isClLocked ? "解锁" : "锁定"}</button>
                  <button data-action="delete" class="danger" ${
-                   locked ? "disabled" : ""
+                   locked || isClLocked ? "disabled" : ""
+                 }${
+                   isClLocked ? ' title="已定稿锁定：解锁后才能删除"' : ""
                  }>删除</button>`
           }
         </span>
@@ -1037,9 +1278,10 @@ function editorHtml(item) {
 //   错误归一化后交回入口按各自方式展示。
 // 入口只负责本地预检、参数准备、确认与各自的错误展示；取消不经过这里（不发写稿请求）。
 // spec = {
-//   kind,              // "merge" | "split" | "duplicate"
+//   kind,              // "merge" | "split" | "duplicate" | "delete"
 //   path,              // 接口路径（POST JSON，HTTP 方法 / 字段 / 状态码保持既有约定）
-//   params,            // 入口备好的接口参数（草稿快照由协调层统一附上）
+//   params,            // 入口备好的接口参数（草稿快照与 lock_ids 由协调层统一附上）
+//   repointed?,        // 成功回包按最新锁定集合核验时的统一改指映射（合并 / 拆分落后段）
 //   onSuccess(data)?,  // 入口附加的成功处理（如收起被并条款的引用面板、退出拆分选择器）
 //   onError(errors)?,  // 入口各自的错误展示（errors 已归一化为字符串数组）
 //   onBusy(busy)?,     // 入口自己的忙碌态展示（如拆分选择器按钮；成功不写回时不再复位）
@@ -1053,9 +1295,22 @@ async function submitWrite(spec) {
   syncBusy();
   syncToolbar();
   try {
-    const data = await api(spec.path, { ...snapshot(), ...spec.params });
+    const data = await api(spec.path, { ...snapshot(), ...spec.params, lock_ids: lockPayload() });
     if (token !== writeSeq || epoch !== state.epoch) return; // 已重新导入：旧结果不得写回新稿
-    // 仅在服务端成功后才改动草稿：正文、顺序与身份上界一起写回，
+    // 成功回包须按**最新锁定集合**检查（等待期间可能已切换锁定）：违例整次不安装，
+    // 不能先更新上界或复核——先在离屏结果上核验，通过后才一次性写回草稿。
+    const violations = spec.checkLocks
+      ? spec.checkLocks(data, state.lockIds)
+      : lockViolationsInResult(data, state.lockIds, spec.repointed || {});
+    if (violations.length) {
+      state.writing = null;
+      if (spec.onBusy) spec.onBusy(false);
+      spec.onError(formatLockViolations(violations));
+      syncBusy();
+      syncToolbar();
+      return;
+    }
+    // 仅在服务端成功且本地锁定核验通过后才改动草稿：正文、顺序与身份上界一起写回，
     // 保证列表 / 预览 / 对照 / 引用追踪 / 摘录 / 下载立即对应同一份草稿
     state.orderIds = data.order_ids;
     state.clauses = data.clauses.map((c) => ({
@@ -1065,7 +1320,7 @@ async function submitWrite(spec) {
     }));
     if (spec.kind === "split") state.idCounter += 1; // 拆分：新身份已投入使用，上界推进 1
     else if (spec.kind === "duplicate") state.idCounter = data.next_id; // 复制：采用接口返回的上界
-    // 合并：不推进身份上界
+    // 合并 / 删除：不推进身份上界
     state.writing = null;
     if (spec.onSuccess) spec.onSuccess(data);
     touch();
@@ -1224,15 +1479,24 @@ async function submitSplit(id) {
 
   // 参数准备：后段新身份为本草稿从未用过的 id（删除/合并移除的身份不复用，失效引用不会复活）；
   // 请求归属、草稿写回（含上界推进 1）与收尾由提交协调层统一处理
+  const refsTo = state.splitRefsTo;
+  const newId = `c${state.idCounter + 1}`;
+  // 锁定预检（权威核验仍在服务端）：在拟拆分结果上复用统一核验
+  const localSplitViolations = splitLockPrecheck(id, offset, newId, refsTo);
+  if (localSplitViolations.length) {
+    showSplitError(id, formatLockViolations(localSplitViolations));
+    return;
+  }
   await submitWrite({
     kind: "split",
     path: "/api/split",
     params: {
       split_id: id,
       offset,
-      new_id: `c${state.idCounter + 1}`,
-      refs_to: state.splitRefsTo,
+      new_id: newId,
+      refs_to: refsTo,
     },
+    repointed: refsTo === "back" ? { [id]: newId } : {},
     onBusy: (busy) => setSplitBusy(id, busy),
     onSuccess: () => {
       // 拆分成功：退出选择器，分界与引用落点复位（草稿已由协调层写回）
@@ -1293,6 +1557,13 @@ mergeBtn.addEventListener("click", async () => {
   const [a, b] = state.pickIds;
   const keepId = state.orderIds.indexOf(a) < state.orderIds.indexOf(b) ? a : b;
   const dropId = keepId === a ? b : a;
+  // 锁定预检（权威核验仍在服务端）：较后身份被锁、较前身份被锁、或任一锁定条款正文
+  // 引用较后条款（合并会改指）时整次拒绝。这里仅拦明显情形，复杂交叠由服务端按结果判定。
+  const localMergeViolations = mergeLockPrecheck(keepId, dropId);
+  if (localMergeViolations.length) {
+    alert(formatLockViolations(localMergeViolations).join("\n"));
+    return;
+  }
   const previewById = Object.fromEntries(state.preview.items.map((it) => [it.id, it]));
   const keep = previewById[keepId];
   const drop = previewById[dropId];
@@ -1317,6 +1588,7 @@ mergeBtn.addEventListener("click", async () => {
     kind: "merge",
     path: "/api/merge",
     params: { keep_id: keepId, drop_id: dropId },
+    repointed: { [dropId]: keepId }, // 回包核验时区分"改指"与"目标删除"
     onSuccess: () => {
       // 被并入的较后条款已移除：查询它的面板立即收起清空（查较前条款的保留并自动重查）
       if (state.refsId === dropId) closeReferrers();
@@ -1396,7 +1668,9 @@ clauseList.addEventListener("click", async (ev) => {
   const action = btn.dataset.action;
 
   // 编辑中、拆分选择中、合并/拆分提交中或预览失败致列表锁定时：
-  // 阻止 编辑 / 删除 / 重排 / 打开拆分 / 引用查询 / 复核（按钮已禁用，这里再兜底）
+  // 阻止 编辑 / 删除 / 重排 / 打开拆分 / 引用查询 / 复核（按钮已禁用，这里再兜底）。
+  // 「锁定 / 解锁」不在此列：写稿等待时也允许切换（纯本页内存操作）；
+  // 编辑 / 拆分选择进行中卡片不渲染锁定按钮，无需拦截。
   if (
     ["up", "down", "edit", "delete", "split", "refs", "review"].includes(action) &&
     (state.editingId || state.splittingId || listLocked())
@@ -1411,6 +1685,10 @@ clauseList.addEventListener("click", async (ev) => {
     touch();
     render();
   } else if (action === "edit") {
+    if (state.lockIds.includes(id)) {
+      alert("该条款已定稿锁定，请先解锁再编辑。");
+      return;
+    }
     closeReferrers(); // 未保存编辑须先结束；引用结果随目标面板收起而清空
     state.editingId = id;
     render().then(() => {
@@ -1425,17 +1703,38 @@ clauseList.addEventListener("click", async (ev) => {
     const inbound = state.clauses.filter(
       (c) => c.id !== id && c.body.includes(`[[${id}]]`),
     ).length;
+    const lockedHere = state.lockIds.includes(id);
+    const blockedRefs = state.clauses.filter(
+      (c) => state.lockIds.includes(c.id) && c.body.includes(`[[${id}]]`),
+    ).length;
+    if (lockedHere || blockedRefs) {
+      // 本地先给一道明确提示（服务端仍按实际结果 409 兜底）
+      const parts = [];
+      if (lockedHere) parts.push("该条款本身已锁定");
+      if (blockedRefs) parts.push(`有 ${blockedRefs} 条锁定条款的有效引用指向它`);
+      alert(`删除被锁定保护整次拒绝：${parts.join("；")}。请先解锁相关条款。`);
+      return;
+    }
     const msg =
       `确定删除该条款？\n` +
       (inbound ? `有 ${inbound} 条条款引用它，删除后这些引用将标为失效，修复前无法下载。\n` : "") +
       `（编号会自动重排，此操作在重新导入或刷新前不可撤销）`;
     if (!confirm(msg)) return;
     if (state.refsId === id) closeReferrers(); // 目标即被删条款：先收起并清空，不发注定失效的查询
-    state.orderIds = state.orderIds.filter((x) => x !== id);
-    state.clauses = state.clauses.filter((c) => c.id !== id);
-    state.pickIds = state.pickIds.filter((x) => x !== id);
-    touch();
-    render();
+    // 删除同样经 HTTP 处理并随请求携带锁定集合：即使删除对象未锁定，只要会改变任一
+    // 锁定条款或使其引用失效，服务端就整次拒绝（409）；请求归属、草稿写回与收尾复用协调层
+    await submitWrite({
+      kind: "delete",
+      path: "/api/delete",
+      params: { delete_id: id },
+      onSuccess: () => {
+        state.pickIds = state.pickIds.filter((x) => x !== id);
+      },
+      onError: (errors) => {
+        // 删除被拒绝（如锁定保护）：草稿未改动，给出原因
+        alert("删除失败，草稿未改动：\n" + errors.join("\n"));
+      },
+    });
   } else if (action === "cancel") {
     state.editingId = null;
     render();
@@ -1461,6 +1760,9 @@ clauseList.addEventListener("click", async (ev) => {
   } else if (action === "review") {
     // 复核只针对已保存正文；编辑 / 拆分选择 / 写稿提交 / 预览未同步时不能复核（函数内再兜底）
     reviewClause(id);
+  } else if (action === "lock") {
+    // 锁定 / 解锁：本页内存操作，写稿等待时也允许，不改草稿、预览与复核
+    toggleLock(id);
   } else if (action === "refs") {
     if (state.refsId === id) {
       closeReferrers(); // 再点一次：收起并清空结果，在途响应回来也不再采用
@@ -1513,8 +1815,30 @@ async function saveEdit(id) {
   state.saving = true;
   setEditorBusy(id, true);
   try {
-    const data = await api("/api/save", { ...snapshot(), edit_id: id, text });
+    const data = await api("/api/save", {
+      ...snapshot(),
+      edit_id: id,
+      text,
+      lock_ids: lockPayload(),
+    });
     if (epoch !== state.epoch) return; // 已重新导入：旧保存结果不得作用于新草稿
+    // 成功回包按**最新锁定集合**核验：等待期间可能已切换锁定；违例整次不安装，
+    // 不先更新草稿、上界或复核，编辑器保留以便用户调整或取消
+    const violations = lockViolationsAfterSave(id, data.body, state.lockIds);
+    if (violations.length) {
+      state.saving = false;
+      setEditorBusy(id, false);
+      const errBox = document
+        .getElementById(`card-${id}`)
+        ?.querySelector('[data-role="edit-errors"]');
+      if (errBox) {
+        errBox.innerHTML = formatLockViolations(violations)
+          .map((m) => `<li>${esc(m)}</li>`)
+          .join("");
+        errBox.hidden = false;
+      }
+      return;
+    }
     const clause = state.clauses.find((c) => c.id === id);
     if (clause) clause.body = data.body;
     state.editingId = null;
